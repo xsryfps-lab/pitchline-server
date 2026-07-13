@@ -1,83 +1,66 @@
-// Adapter around TheSportsDB — chosen specifically because it needs ZERO
-// signup: the free key below is TheSportsDB's public test key, published on
-// their own docs (thesportsdb.com/documentation). Nothing to register, so
-// nothing to get suspended or fail to sign up for.
-//
-// Tradeoff: the free tier doesn't include true minute-by-minute live scores
-// (that's a Patreon-only feature) — upcoming fixtures, results and league
-// tables all work fine though, which covers most of the app. If you want
-// real live-in-play data later, a Patreon key (thesportsdb.com/patreon)
-// unlocks it and only this file needs to change.
+// Adapter around OpenLigaDB — a free, keyless, crowd-run German football API
+// that's been stable for years (api.openligadb.de). No signup, no key, no
+// suspension risk, 1000 requests/hour. The tradeoff: reliable coverage is
+// German football only (Bundesliga, 2. Bundesliga, DFB-Pokal). Broader
+// leagues (Premier League, La Liga, etc.) need a paid-tier key from a
+// provider like api-football or football-data.org — swap it in here later,
+// this is the only file that needs to change.
 
-const FREE_KEY = process.env.FOOTBALL_API_KEY || "123";
-const BASE_URL = `https://www.thesportsdb.com/api/v1/json/${FREE_KEY}`;
+const BASE_URL = "https://api.openligadb.de";
 
-async function apiGet(path, params = {}) {
-  const url = new URL(`${BASE_URL}${path}`);
-  Object.entries(params).forEach(([k, v]) => v != null && url.searchParams.set(k, v));
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`TheSportsDB ${path} failed: ${res.status} ${await res.text()}`);
+async function apiGet(path) {
+  const res = await fetch(`${BASE_URL}${path}`);
+  if (!res.ok) throw new Error(`OpenLigaDB ${path} failed: ${res.status} ${await res.text()}`);
   return res.json();
 }
 
-// Internal league id -> TheSportsDB numeric league id.
+// Internal league id -> OpenLigaDB league shortcut.
 export const PROVIDER_LEAGUE_ID = {
-  epl: 4328,
-  champ: 4329,
-  laliga: 4335,
-  bund: 4331,
-  seriea: 4332,
-  ligue1: 4334,
-  eredivisie: 4337,
-  brasileirao: 4351,
-  mls: 4346,
-  ucl: 4480,
+  bund: "bl1",
+  bund2: "bl2",
+  dfbpokal: "dfb",
 };
 
-function currentSeasonLabel(leagueId) {
+function currentSeason() {
   const now = new Date();
-  if (leagueId === "mls" || leagueId === "brasileirao") return String(now.getFullYear());
   const y = now.getFullYear();
-  return now.getMonth() + 1 >= 7 ? `${y}-${y + 1}` : `${y - 1}-${y}`;
+  return now.getMonth() + 1 >= 7 ? y : y - 1; // German season runs roughly July/Aug -> May
 }
 
-// No true live-in-play feed on the free tier — returns [] so the app just
-// shows "nothing live" honestly instead of faking it.
+// No live-in-play feed on this provider — returns [] so the app shows
+// "nothing live" honestly rather than faking it.
 export async function fetchLiveFixtures() {
   return [];
 }
 
-export async function fetchUpcoming(leagueId) {
-  const data = await apiGet("/eventsnextleague.php", { id: PROVIDER_LEAGUE_ID[leagueId] });
-  return (data.events || []).map((e) => normalizeEvent(e, leagueId));
+// Returns every match (upcoming + finished) for the given league's current
+// season in one call, which we then split by matchIsFinished.
+export async function fetchSeasonMatches(leagueId, season = currentSeason()) {
+  const matches = await apiGet(`/getmatchdata/${PROVIDER_LEAGUE_ID[leagueId]}/${season}`);
+  return (matches || []).map((m) => normalizeMatch(m, leagueId));
 }
 
-export async function fetchRecentResults(leagueId) {
-  const data = await apiGet("/eventspastleague.php", { id: PROVIDER_LEAGUE_ID[leagueId] });
-  return (data.events || []).map((e) => normalizeEvent(e, leagueId));
+export async function fetchStandings(leagueId, season = currentSeason()) {
+  return apiGet(`/getbltable/${PROVIDER_LEAGUE_ID[leagueId]}/${season}`);
 }
 
-export async function fetchStandings(leagueId) {
-  const data = await apiGet("/lookuptable.php", { l: PROVIDER_LEAGUE_ID[leagueId], s: currentSeasonLabel(leagueId) });
-  return data.table || [];
-}
-
-function normalizeEvent(e, leagueId) {
-  const hasScore = e.intHomeScore !== null && e.intHomeScore !== undefined;
-  const kickoff = e.strTimestamp ? new Date(e.strTimestamp) : new Date(`${e.dateEvent}T${e.strTime || "00:00:00"}Z`);
+function normalizeMatch(m, leagueId) {
+  const finalResult = m.matchResults?.find((r) => r.resultTypeID === 2) || m.matchResults?.[m.matchResults.length - 1];
   return {
-    id: String(e.idEvent),
+    id: String(m.matchID),
     league_id: leagueId,
-    home_team_id: `${leagueId}-${e.idHomeTeam}`,
-    away_team_id: `${leagueId}-${e.idAwayTeam}`,
-    home_team_name: e.strHomeTeam,
-    away_team_name: e.strAwayTeam,
-    status: hasScore ? "finished" : "upcoming",
-    kickoff: kickoff.toISOString(),
+    home_team_id: `${leagueId}-${m.team1.teamId}`,
+    away_team_id: `${leagueId}-${m.team2.teamId}`,
+    home_team_name: m.team1.shortName || m.team1.teamName,
+    away_team_name: m.team2.shortName || m.team2.teamName,
+    status: m.matchIsFinished ? "finished" : "upcoming",
+    kickoff: m.matchDateTimeUTC,
     minute: null,
-    home_score: hasScore ? Number(e.intHomeScore) : null,
-    away_score: hasScore ? Number(e.intAwayScore) : null,
-    venue: e.strVenue,
+    home_score: m.matchIsFinished && finalResult ? finalResult.pointsTeam1 : null,
+    away_score: m.matchIsFinished && finalResult ? finalResult.pointsTeam2 : null,
+    venue: m.location?.locationStadium,
     referee: null,
   };
 }
+
+export { currentSeason };
