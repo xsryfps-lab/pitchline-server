@@ -1,6 +1,6 @@
 import cron from "node-cron";
 import { sql } from "./db.js";
-import { PROVIDER_LEAGUE_ID, fetchUpcoming, fetchRecentResults, fetchStandings } from "./footballProvider.js";
+import { PROVIDER_LEAGUE_ID, fetchSeasonMatches, fetchStandings, currentSeason } from "./footballProvider.js";
 import { predictionWindow, shouldRegenerate, statisticalModel, deriveMarkets, correctScoreDistribution, generateReasoning } from "./predictor.js";
 
 async function upsertTeam(id, leagueId, name) {
@@ -50,47 +50,56 @@ async function maybePredict(match) {
   `;
 }
 
-// No true live feed on this free provider (see footballProvider.js) — this
-// just stays a no-op hook so the cron schedule and architecture are ready
-// to light up the moment you add a live-capable key.
 async function pollLive() {}
 
 async function pollUpcoming() {
   for (const leagueId of Object.keys(PROVIDER_LEAGUE_ID)) {
     try {
-      const [upcoming, recent] = await Promise.all([fetchUpcoming(leagueId), fetchRecentResults(leagueId)]);
-      for (const f of [...upcoming, ...recent]) {
+      let matches = await fetchSeasonMatches(leagueId, currentSeason());
+      if (matches.length === 0) {
+        // New season not scheduled yet — fall back to last season so the
+        // league page isn't empty (finished matches still show real data).
+        matches = await fetchSeasonMatches(leagueId, currentSeason() - 1);
+      }
+      for (const f of matches) {
         await upsertMatch(f);
         await maybePredict(f);
       }
-      console.log(`pollUpcoming(${leagueId}): ${upcoming.length} upcoming, ${recent.length} recent`);
+      console.log(`pollUpcoming(${leagueId}): ${matches.length} matches synced`);
     } catch (e) {
       console.error(`pollUpcoming(${leagueId}) failed:`, e.message);
     }
-    await new Promise((r) => setTimeout(r, 400)); // stay well under the free rate limit
+    await new Promise((r) => setTimeout(r, 300));
   }
 }
 
 async function pollStandings() {
   for (const leagueId of Object.keys(PROVIDER_LEAGUE_ID)) {
     try {
-      const table = await fetchStandings(leagueId);
-      for (const row of table) {
-        const teamId = `${leagueId}-${row.idTeam}`;
-        await upsertTeam(teamId, leagueId, row.strTeam);
+      let table = await fetchStandings(leagueId, currentSeason());
+      let seasonUsed = String(currentSeason());
+      if (!table || table.length === 0) {
+        table = await fetchStandings(leagueId, currentSeason() - 1);
+        seasonUsed = String(currentSeason() - 1);
+      }
+      let rank = 1;
+      for (const row of table || []) {
+        const teamId = `${leagueId}-${row.teamInfoId}`;
+        await upsertTeam(teamId, leagueId, row.shortName || row.teamName);
         await sql`
           insert into standings (league_id, team_id, rank, played, wins, draws, losses, points, season_label, is_current)
-          values (${leagueId}, ${teamId}, ${Number(row.intRank)}, ${Number(row.intPlayed)}, ${Number(row.intWin)}, ${Number(row.intDraw)}, ${Number(row.intLoss)}, ${Number(row.intPoints)}, ${row.strSeason || String(new Date().getFullYear())}, true)
+          values (${leagueId}, ${teamId}, ${rank}, ${row.matches}, ${row.won}, ${row.draw}, ${row.lost}, ${row.points}, ${seasonUsed}, true)
           on conflict (league_id, team_id, group_name, season_label) do update set
             rank = excluded.rank, played = excluded.played, wins = excluded.wins,
             draws = excluded.draws, losses = excluded.losses, points = excluded.points, updated_at = now()
         `;
+        rank++;
       }
-      console.log(`pollStandings(${leagueId}): ${table.length} rows`);
+      console.log(`pollStandings(${leagueId}): ${table?.length || 0} rows (season ${seasonUsed})`);
     } catch (e) {
       console.error(`pollStandings(${leagueId}) failed:`, e.message);
     }
-    await new Promise((r) => setTimeout(r, 400));
+    await new Promise((r) => setTimeout(r, 300));
   }
 }
 
