@@ -1,9 +1,7 @@
 import cron from "node-cron";
 import { sql } from "./db.js";
-import { PROVIDER_LEAGUE_ID, fetchLiveFixtures, fetchFixturesInRange, fetchStandings, normalizeFixture } from "./footballProvider.js";
+import { PROVIDER_LEAGUE_ID, fetchUpcoming, fetchRecentResults, fetchStandings } from "./footballProvider.js";
 import { predictionWindow, shouldRegenerate, statisticalModel, deriveMarkets, correctScoreDistribution, generateReasoning } from "./predictor.js";
-
-const TRACKED_LEAGUES = Object.keys(PROVIDER_LEAGUE_ID); // trim this list to what you actually pay for
 
 async function upsertTeam(id, leagueId, name) {
   await sql`
@@ -28,91 +26,80 @@ async function upsertMatch(f) {
 
 async function maybePredict(match) {
   const window = predictionWindow(match.kickoff, match.status);
-  // Detect a goal since the last poll as the live-update trigger.
   const [prevRow] = await sql`select home_score, away_score from matches where id = ${match.id}`;
   const goalHappened = prevRow && (prevRow.home_score !== match.home_score || prevRow.away_score !== match.away_score);
-  const signal = goalHappened ? "goal" : match.status === "half_time" ? "half_time" : null;
+  const signal = goalHappened ? "goal" : null;
 
   if (!(await shouldRegenerate(match.id, window, signal))) return;
 
   const [homeStats] = await sql`select points from standings where team_id = ${match.home_team_id} limit 1`;
   const [awayStats] = await sql`select points from standings where team_id = ${match.away_team_id} limit 1`;
   const { homeWin, draw, awayWin, confidence } = statisticalModel({
-    homeForm: ["W", "D", "W", "L", "W"], // TODO: pull last-5 results once /fixtures/headtohead or team-form endpoint is wired
+    homeForm: ["W", "D", "W", "L", "W"], // TODO: derive from recent results once results history is stored
     awayForm: ["W", "W", "D", "L", "D"],
     homePoints: homeStats?.points || 20,
     awayPoints: awayStats?.points || 20,
   });
   const markets = deriveMarkets({ homeWin, awayWin });
-  const scores = correctScoreDistribution({ homeWin, awayWin, draw });
+  const scores = correctScoreDistribution({ homeWin, awayWin });
   const reasoning = await generateReasoning({ homeName: match.home_team_id, awayName: match.away_team_id, homeWin, draw, awayWin });
 
   await sql`
     insert into predictions (match_id, trigger, home_win_pct, draw_pct, away_win_pct, btts_yes_pct, over25_pct, corners_line, corners_over_pct, correct_scores, confidence, data_quality, reasoning)
-    values (${match.id}, ${window === "live" ? "live_event" : window === "full" ? "pre_3h" : "pre_24h"}, ${homeWin}, ${draw}, ${awayWin}, ${markets.btts.yes}, ${markets.over25.over}, ${markets.corners.line}, ${markets.corners.over}, ${JSON.stringify(scores)}, ${confidence}, 85, ${reasoning})
+    values (${match.id}, ${window === "live" ? "live_event" : window === "full" ? "pre_3h" : "pre_24h"}, ${homeWin}, ${draw}, ${awayWin}, ${markets.btts.yes}, ${markets.over25.over}, ${markets.corners.line}, ${markets.corners.over}, ${JSON.stringify(scores)}, ${confidence}, 80, ${reasoning})
   `;
 }
 
-async function pollLive() {
-  const fixtures = await fetchLiveFixtures();
-  for (const f of fixtures) {
-    const leagueId = Object.keys(PROVIDER_LEAGUE_ID).find((k) => PROVIDER_LEAGUE_ID[k] === f.league.id);
-    if (!leagueId) continue;
-    const normalized = normalizeFixture(f, leagueId);
-    await upsertMatch(normalized);
-    await maybePredict(normalized);
-  }
-}
+// No true live feed on this free provider (see footballProvider.js) — this
+// just stays a no-op hook so the cron schedule and architecture are ready
+// to light up the moment you add a live-capable key.
+async function pollLive() {}
 
 async function pollUpcoming() {
-  const from = new Date().toISOString().slice(0, 10);
-  const to = new Date(Date.now() + 7 * 86400000).toISOString().slice(0, 10);
-  for (const leagueId of TRACKED_LEAGUES) {
+  for (const leagueId of Object.keys(PROVIDER_LEAGUE_ID)) {
     try {
-      const fixtures = await fetchFixturesInRange(PROVIDER_LEAGUE_ID[leagueId], from, to, new Date().getFullYear());
-      for (const f of fixtures) {
-        const normalized = normalizeFixture(f, leagueId);
-        await upsertMatch(normalized);
-        await maybePredict(normalized);
+      const [upcoming, recent] = await Promise.all([fetchUpcoming(leagueId), fetchRecentResults(leagueId)]);
+      for (const f of [...upcoming, ...recent]) {
+        await upsertMatch(f);
+        await maybePredict(f);
       }
+      console.log(`pollUpcoming(${leagueId}): ${upcoming.length} upcoming, ${recent.length} recent`);
     } catch (e) {
       console.error(`pollUpcoming(${leagueId}) failed:`, e.message);
     }
+    await new Promise((r) => setTimeout(r, 400)); // stay well under the free rate limit
   }
 }
 
 async function pollStandings() {
-  for (const leagueId of TRACKED_LEAGUES) {
+  for (const leagueId of Object.keys(PROVIDER_LEAGUE_ID)) {
     try {
-      const [data] = await fetchStandings(PROVIDER_LEAGUE_ID[leagueId], new Date().getFullYear());
-      const table = data?.league?.standings?.[0] || [];
+      const table = await fetchStandings(leagueId);
       for (const row of table) {
-        const teamId = `${leagueId}-${row.team.id}`;
-        await upsertTeam(teamId, leagueId, row.team.name);
+        const teamId = `${leagueId}-${row.idTeam}`;
+        await upsertTeam(teamId, leagueId, row.strTeam);
         await sql`
           insert into standings (league_id, team_id, rank, played, wins, draws, losses, points, season_label, is_current)
-          values (${leagueId}, ${teamId}, ${row.rank}, ${row.all.played}, ${row.all.win}, ${row.all.draw}, ${row.all.lose}, ${row.points}, ${String(new Date().getFullYear())}, true)
+          values (${leagueId}, ${teamId}, ${Number(row.intRank)}, ${Number(row.intPlayed)}, ${Number(row.intWin)}, ${Number(row.intDraw)}, ${Number(row.intLoss)}, ${Number(row.intPoints)}, ${row.strSeason || String(new Date().getFullYear())}, true)
           on conflict (league_id, team_id, group_name, season_label) do update set
             rank = excluded.rank, played = excluded.played, wins = excluded.wins,
             draws = excluded.draws, losses = excluded.losses, points = excluded.points, updated_at = now()
         `;
       }
+      console.log(`pollStandings(${leagueId}): ${table.length} rows`);
     } catch (e) {
       console.error(`pollStandings(${leagueId}) failed:`, e.message);
     }
+    await new Promise((r) => setTimeout(r, 400));
   }
 }
 
 export function startPoller() {
-  // Live scores + live-event predictions: every 30s, only matters when something's actually live.
   cron.schedule("*/30 * * * * *", () => pollLive().catch((e) => console.error("pollLive error", e)));
-  // Upcoming fixtures + pre-kickoff predictions: every 15 min.
   cron.schedule("*/15 * * * *", () => pollUpcoming().catch((e) => console.error("pollUpcoming error", e)));
-  // Standings: every 6 hours — tables don't need to be real-time.
   cron.schedule("0 */6 * * *", () => pollStandings().catch((e) => console.error("pollStandings error", e)));
 
-  console.log("Poller scheduled: live/30s, upcoming/15min, standings/6h");
-  // Run once immediately on boot so the DB isn't empty while cron warms up.
+  console.log("Poller scheduled: live/30s (no-op on this provider), upcoming/15min, standings/6h");
   pollUpcoming().catch((e) => console.error(e));
   pollStandings().catch((e) => console.error(e));
 }
